@@ -70,7 +70,22 @@ int process_multithread(struct list* items, int nb_thread, int queue_limit) {
    * - Ajouter toutes les images à traiter en file
    * - Attendre que le traitement soit terminé
    */
-  printf("À IMPLÉMENTER\n");
+  //Créer un "thread pool" avec nb_thread fils d'exécution
+  struct pool* pool = threadpool_create(nb_thread, queue_limit);
+  if(!pool){
+      fprintf(stderr, "Erreur: Impossible de creer le thread pool\n");
+      return -1;
+  }
+  struct list_node* node = list_head(items);
+  //Ajouter toutes les images à traiter en file
+  while (!list_end(node)) {
+      threadpool_add_task(pool, process_one_image, node->data);
+      node = node->next;
+
+  }
+  //Attendre que le traitement soit terminé
+  threadpool_join(pool);
+
 
   return 0;
 }

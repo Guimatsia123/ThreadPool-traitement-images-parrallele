@@ -1,95 +1,138 @@
 #include "threadpool.h"
-
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/prctl.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <string.h>
 
 void* worker(void* arg) {
-  /*
-   * À compléter:
-   *
-   * Attendre que tous les fils d'exécution soient démarrés en utilisant une
-   * barrière. Ceci permet de s'assurer que tous les fils d'exécution sont en
-   * fonction quand threadpool_create() retourne.
-   *
-   * Dans une boucle infinie, on vérifie s'il y a des tâches dans la liste.
-   * Si c'est le cas, on prend un élément de la liste et on exécute la fonction.
-   * La fonction est l'argument sont spécifiés dans l'item de la liste:
-   *
-   *    task->func(task->arg);
-   *
-   * On doit attendre un élément à traiter en utilisant sem_wait().
-   *
-   * Attention: la liste peut être corrompue si on l'accède dans plusieurs
-   * fils d'exécution en même temps. Il faut donc protéger l'accès avec un
-   * verrou. Il faut également le verrou pour lire la variable pool->running.
-   *
-   * La boucle doit se terminer si pool->running est faux ET que la liste
-   * pool->task_list est vide.
-   */
+    struct worker_arg* w = arg;
+    struct pool* pool = w->pool;
 
-  struct worker_arg* w = arg;
-  struct pool* pool = w->pool;
+    // Synchronisation des threads avec une barrière
+    pthread_barrier_wait(&pool->ready);
 
-  return NULL;
+    while (1) {
+        // Attendre qu'une tâche soit disponible
+        sem_wait(&pool->work_busy);
+
+        pthread_mutex_lock(&pool->lock);
+        // Vérifier si le pool doit s'arrêter et si la liste est vide
+        if (!pool->running && list_empty(pool->task_list)) {
+            pthread_mutex_unlock(&pool->lock);
+            break;
+        }
+
+        // Récupérer une tâche depuis la liste
+        struct list_node* node = list_pop_front(pool->task_list);
+        pthread_mutex_unlock(&pool->lock);
+
+        if (node) {
+            // Exécuter la fonction associée à la tâche
+            struct task* task = (struct task*)node->data;
+            task->func(task->arg);
+            free(task);
+            free(node);
+        }
+
+        // Indiquer qu'une place est libre dans la file
+        sem_post(&pool->work_free);
+    }
+
+    return NULL;
 }
 
 struct pool* threadpool_create(int nb_threads, int queue_limit) {
-  /*
-   * À compléter:
-   *
-   * Allouer la structure que la fonction retourne struct pool*
-   *
-   * Passer en revue tous les champs et initialiser correctement, en allouant la
-   * mémoire au besoin. La taille de la file d'attente ne doit jamais dépasser
-   * queue_limit.
-   *
-   * Initialiser le verrou lock
-   * Initialiser les sémaphore work_busy et work_free
-   * Initialiser la barrière
-   * Créer la liste de travail task_list
-   *
-   * Démarrer les fils d'exécution
-   *
-   * Attendre la confirmation qu'ils sont tous démarrés avec la barrière. La
-   * fonction doit retourner uniquement quand tous les fils ont été démarrés.
-   *
-   * Retourner le pointeur vers la structure.
-   */
+    // Allouer la mémoire pour la structure du pool
+    struct pool* pool = malloc(sizeof(struct pool));
+    if (!pool) return NULL;
 
-  return NULL;
+    pool->nb_threads = nb_threads;
+    pool->threads = malloc(nb_threads * sizeof(pthread_t));
+    pool->args = malloc(nb_threads * sizeof(struct worker_arg));
+    pool->task_list = list_new(NULL, free);
+    pool->running = 1;
+    pool->task_list->max_size = queue_limit;
+
+    // Vérifier si toutes les allocations ont réussi
+    if (!pool->threads || !pool->args || !pool->task_list) {
+        free(pool->threads);
+        free(pool->args);
+        list_free(pool->task_list);
+        free(pool);
+        return NULL;
+    }
+
+    // Initialiser les verrous et les sémaphores
+    pthread_mutex_init(&pool->lock, NULL);
+    sem_init(&pool->work_busy, 0, 0);
+    sem_init(&pool->work_free, 0, queue_limit);
+    pthread_barrier_init(&pool->ready, NULL, nb_threads);
+
+    // Créer les threads et les associer au pool
+    for (int i = 0; i < nb_threads; i++) {
+        pool->args[i].id = i;
+        pool->args[i].pool = pool;
+        pthread_create(&pool->threads[i], NULL, worker, &pool->args[i]);
+    }
+
+    // Attendre que tous les threads soient prêts
+    pthread_barrier_wait(&pool->ready);
+
+    return pool;
 }
 
 void threadpool_add_task(struct pool* pool, func_t fn, void* arg) {
-  /*
-   * À compléter:
-   *
-   * Allouer un struct task, assigner func et arg passés en argument.
-   *
-   * Ensuite, créer un nouveau noeud de liste pour contenir la tâche créée.
-   * Ajouter ce noeuds à la fin de la liste.
-   *
-   * Incrémenter le sémaphore pour réveiller un fil d'exécution.
-   *
-   * Attention: il faut toujours accéder à la liste avec un verrou pour éviter
-   * une condition critique!
-   */
+    // Créer une nouvelle tâche
+    struct task* new_task = malloc(sizeof(struct task));
+    if (!new_task) return;
+
+    new_task->func = fn;
+    new_task->arg = arg;
+
+    // Créer un noeud pour la tâche
+    struct list_node* node = list_node_new(new_task);
+    if (!node) {
+        free(new_task);
+        return;
+    }
+
+    // Attendre qu'une place soit disponible dans la file
+    sem_wait(&pool->work_free);
+
+    pthread_mutex_lock(&pool->lock);
+    // Ajouter la tâche à la fin de la liste
+    list_push_back(pool->task_list, node);
+    pthread_mutex_unlock(&pool->lock);
+
+    // Signaler qu'une nouvelle tâche est disponible
+    sem_post(&pool->work_busy);
 }
 
 void threadpool_join(struct pool* pool) {
-  /*
-   * À compléter:
-   *
-   * Mettre pool->running à 0 pour indiquer que l'on désire terminer
-   * l'exécution. Ensuite, on incrémente le sémaphore une fois pour
-   * chaque fil d'exécution, de manière à les réveiller.
-   *
-   * Attendre que tous les fils d'exécution se terminent, puis libérer la
-   * mémoire allouée dans threadpool_create().
-   *
-   * Quand la fonction retourne, la structure pool n'est plus utilisable.
-   */
+    pthread_mutex_lock(&pool->lock);
+    // Signaler aux threads qu'ils doivent s'arrêter
+    pool->running = 0;
+    pthread_mutex_unlock(&pool->lock);
 
-  return;
+    // Réveiller tous les threads en attente
+    for (int i = 0; i < pool->nb_threads; i++) {
+        sem_post(&pool->work_busy);
+    }
+
+    // Attendre la fin de tous les threads
+    for (int i = 0; i < pool->nb_threads; i++) {
+        pthread_join(pool->threads[i], NULL);
+    }
+
+    // Libérer les ressources
+    pthread_mutex_destroy(&pool->lock);
+    sem_destroy(&pool->work_busy);
+    sem_destroy(&pool->work_free);
+    pthread_barrier_destroy(&pool->ready);
+
+    list_free(pool->task_list);
+    free(pool->threads);
+    free(pool->args);
+    free(pool);
 }
